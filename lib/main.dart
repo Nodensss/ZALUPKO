@@ -50,8 +50,7 @@ class _OcrHomePageState extends State<OcrHomePage> {
   final TextEditingController _apiKeyController = TextEditingController();
   final TextEditingController _endpointController =
       TextEditingController(
-        text:
-            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+        text: '/api/gemini',
       );
 
   Uint8List? _imageBytes;
@@ -132,10 +131,13 @@ class _OcrHomePageState extends State<OcrHomePage> {
       });
       return;
     }
+    final endpointText = _endpointController.text.trim();
+    final endpointUri = _resolveEndpoint(endpointText);
+    final useProxy = !endpointUri.hasScheme;
     final apiKey = _apiKeyController.text.trim();
-    if (apiKey.isEmpty) {
+    if (!useProxy && apiKey.isEmpty) {
       setState(() {
-        _errorMessage = 'Введите API-ключ OCR сервиса.';
+        _errorMessage = 'Введите Gemini API ключ.';
       });
       return;
     }
@@ -150,30 +152,12 @@ class _OcrHomePageState extends State<OcrHomePage> {
     try {
       final mimeType = _guessMimeType(_imageName);
       final base64Image = base64Encode(_imageBytes!);
-      final prompt = _buildPrompt();
-      final payload = jsonEncode({
-        'contents': [
-          {
-            'parts': [
-              {
-                'inline_data': {
-                  'mime_type': mimeType,
-                  'data': base64Image,
-                }
-              },
-              {'text': prompt},
-            ],
-          }
-        ],
-      });
-
-      final response = await http.post(
-        Uri.parse(_endpointController.text.trim()),
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': apiKey,
-        },
-        body: payload,
+      final response = await _sendGeminiRequest(
+        endpointUri,
+        apiKey,
+        base64Image,
+        mimeType,
+        useProxy: useProxy,
       );
 
       if (response.statusCode != 200) {
@@ -316,7 +300,7 @@ class _OcrHomePageState extends State<OcrHomePage> {
             ),
             SizedBox(height: 8),
             Text(
-              'Используется Gemini API (Google AI Studio) для извлечения текста.',
+              'Используется серверный ключ Gemini через /api/gemini.',
             ),
           ],
         ),
@@ -335,8 +319,8 @@ class _OcrHomePageState extends State<OcrHomePage> {
             TextField(
               controller: _apiKeyController,
               decoration: const InputDecoration(
-                labelText: 'Gemini API ключ',
-                helperText: 'Ключ из Google AI Studio',
+                labelText: 'Gemini API ключ (не нужен для /api/gemini)',
+                helperText: 'Если используете прямой endpoint, ключ обязателен',
               ),
             ),
             const SizedBox(height: 12),
@@ -636,6 +620,60 @@ String _buildPrompt() {
 Ответ верни строго в JSON без пояснений:
 {"question":"...","options":["...","..."],"correct_answer":"..."}
 ''';
+}
+
+Uri _resolveEndpoint(String endpoint) {
+  final uri = Uri.parse(endpoint);
+  if (uri.hasScheme) {
+    return uri;
+  }
+  return Uri.base.resolve(endpoint);
+}
+
+Future<http.Response> _sendGeminiRequest(
+  Uri endpoint,
+  String apiKey,
+  String base64Image,
+  String mimeType, {
+  required bool useProxy,
+}) {
+  if (useProxy) {
+    final payload = jsonEncode({
+      'image_base64': base64Image,
+      'mime_type': mimeType,
+    });
+    return http.post(
+      endpoint,
+      headers: {'Content-Type': 'application/json'},
+      body: payload,
+    );
+  }
+
+  final prompt = _buildPrompt();
+  final payload = jsonEncode({
+    'contents': [
+      {
+        'parts': [
+          {
+            'inline_data': {
+              'mime_type': mimeType,
+              'data': base64Image,
+            }
+          },
+          {'text': prompt},
+        ],
+      }
+    ],
+  });
+
+  return http.post(
+    endpoint,
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': apiKey,
+    },
+    body: payload,
+  );
 }
 
 String _guessMimeType(String? fileName) {
