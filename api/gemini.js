@@ -1,6 +1,14 @@
 const GEMINI_ENDPOINT =
   'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
 
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '10mb',
+    },
+  },
+};
+
 function buildPrompt() {
   return `
 Ты получишь скриншот тестового вопроса на русском языке.
@@ -26,7 +34,16 @@ export default async function handler(req, res) {
     return;
   }
 
-  const { image_base64: imageBase64, mime_type: mimeType } = req.body || {};
+  let body = req.body;
+  if (typeof body === 'string') {
+    try {
+      body = JSON.parse(body);
+    } catch (_) {
+      body = {};
+    }
+  }
+
+  const { image_base64: imageBase64, mime_type: mimeType } = body || {};
   if (!imageBase64) {
     res.status(400).json({ error: 'image_base64 is required' });
     return;

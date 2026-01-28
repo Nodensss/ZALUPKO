@@ -133,7 +133,8 @@ class _OcrHomePageState extends State<OcrHomePage> {
     }
     final endpointText = _endpointController.text.trim();
     final endpointUri = _resolveEndpoint(endpointText);
-    final useProxy = !endpointUri.hasScheme;
+    final useProxy =
+        endpointText.startsWith('/api/') || !endpointText.startsWith('http');
     final apiKey = _apiKeyController.text.trim();
     if (!useProxy && apiKey.isEmpty) {
       setState(() {
