@@ -1,0 +1,9 @@
+{
+  "buildCommand": "bash scripts/vercel-build.sh",
+  "outputDirectory": "public",
+  "functions": {
+    "api/*.js": {
+      "runtime": "nodejs20.x"
+    }
+  }
+}
