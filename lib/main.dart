@@ -256,37 +256,22 @@ class _OcrHomePageState extends State<OcrHomePage> {
     });
 
     final results = <BatchExtractionEntry>[];
+    DateTime? lastRequestAt;
     try {
       final total = _batchImages.length;
       for (var i = 0; i < total; i++) {
         final image = _batchImages[i];
-        try {
-          final cleanedText = await _requestGeminiText(
-            imageBytes: image.bytes,
-            imageName: image.name,
-            endpointUri: endpointUri,
-            apiKey: apiKey,
-            useProxy: useProxy,
-            task: GeminiTask.textWithDescription,
-          );
-          final parsed = parseBatchGeminiOutput(cleanedText);
-          results.add(
-            BatchExtractionEntry(
-              fileName: image.name,
-              fullText: parsed.fullText,
-              imageDescription: parsed.imageDescription,
-            ),
-          );
-        } catch (error) {
-          results.add(
-            BatchExtractionEntry(
-              fileName: image.name,
-              fullText: '',
-              imageDescription: '',
-              error: error.toString(),
-            ),
-          );
+        if (lastRequestAt != null) {
+          await _waitForBatchRateLimit(lastRequestAt);
         }
+        final entry = await _extractBatchEntryWithRetry(
+          image: image,
+          endpointUri: endpointUri,
+          apiKey: apiKey,
+          useProxy: useProxy,
+        );
+        lastRequestAt = DateTime.now();
+        results.add(entry);
 
         if (!mounted) {
           return;
@@ -296,6 +281,17 @@ class _OcrHomePageState extends State<OcrHomePage> {
           _batchProgress = (i + 1) / total;
         });
       }
+
+      if (mounted) {
+        final failedCount = results.where((item) => item.error != null).length;
+        setState(() {
+          if (failedCount == 0) {
+            _batchErrorMessage = null;
+          } else {
+            _batchErrorMessage = 'Готово с ошибками: $failedCount.';
+          }
+        });
+      }
     } finally {
       if (mounted) {
         setState(() {
@@ -303,6 +299,77 @@ class _OcrHomePageState extends State<OcrHomePage> {
         });
       }
     }
+  }
+
+  Future<void> _waitForBatchRateLimit(DateTime lastRequestAt) async {
+    const minimumGap = Duration(seconds: 13);
+    final elapsed = DateTime.now().difference(lastRequestAt);
+    final remaining = minimumGap - elapsed;
+    if (remaining > Duration.zero) {
+      await Future.delayed(remaining);
+    }
+  }
+
+  Future<BatchExtractionEntry> _extractBatchEntryWithRetry({
+    required BatchSourceImage image,
+    required Uri endpointUri,
+    required String apiKey,
+    required bool useProxy,
+  }) async {
+    const maxRetries = 4;
+
+    for (var attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        final cleanedText = await _requestGeminiText(
+          imageBytes: image.bytes,
+          imageName: image.name,
+          endpointUri: endpointUri,
+          apiKey: apiKey,
+          useProxy: useProxy,
+          task: GeminiTask.textWithDescription,
+        );
+        final parsed = parseBatchGeminiOutput(cleanedText);
+        return BatchExtractionEntry(
+          fileName: image.name,
+          fullText: parsed.fullText,
+          imageDescription: parsed.imageDescription,
+        );
+      } on GeminiApiException catch (error) {
+        if (error.statusCode != 429 || attempt == maxRetries) {
+          return BatchExtractionEntry(
+            fileName: image.name,
+            fullText: '',
+            imageDescription: '',
+            error: error.toString(),
+          );
+        }
+
+        final waitDuration =
+            (error.retryAfter ?? const Duration(seconds: 45)) +
+            const Duration(seconds: 1);
+        if (mounted) {
+          setState(() {
+            _batchErrorMessage =
+                'Лимит API. Ожидание ${waitDuration.inSeconds} сек, затем повтор.';
+          });
+        }
+        await Future.delayed(waitDuration);
+      } catch (error) {
+        return BatchExtractionEntry(
+          fileName: image.name,
+          fullText: '',
+          imageDescription: '',
+          error: error.toString(),
+        );
+      }
+    }
+
+    return BatchExtractionEntry(
+      fileName: image.name,
+      fullText: '',
+      imageDescription: '',
+      error: 'Не удалось обработать файл.',
+    );
   }
 
   Future<String> _requestGeminiText({
@@ -325,8 +392,10 @@ class _OcrHomePageState extends State<OcrHomePage> {
     );
 
     if (response.statusCode != 200) {
-      throw Exception(
-        'Gemini API вернул статус ${response.statusCode}. ${response.body}',
+      throw GeminiApiException(
+        statusCode: response.statusCode,
+        body: response.body,
+        retryAfter: _extractRetryAfterFromBody(response.body),
       );
     }
 
@@ -885,6 +954,29 @@ class BatchGeminiOutput {
   final String imageDescription;
 }
 
+class GeminiApiException implements Exception {
+  GeminiApiException({
+    required this.statusCode,
+    required this.body,
+    this.retryAfter,
+  });
+
+  final int statusCode;
+  final String body;
+  final Duration? retryAfter;
+
+  @override
+  String toString() {
+    if (statusCode == 429) {
+      final waitText = retryAfter == null
+          ? ''
+          : ' Повторите через ${retryAfter!.inSeconds} сек.';
+      return 'Превышен лимит Gemini API (429).$waitText';
+    }
+    return 'Gemini API вернул статус $statusCode. $body';
+  }
+}
+
 enum GeminiTask {
   questionParser('question_parser'),
   textWithDescription('text_with_description');
@@ -1158,6 +1250,59 @@ Map<String, dynamic>? _tryExtractJson(String text) {
     }
   } catch (_) {}
   return null;
+}
+
+Duration? _extractRetryAfterFromBody(String body) {
+  try {
+    final decoded = jsonDecode(body);
+    if (decoded is Map<String, dynamic>) {
+      final error = decoded['error'];
+      if (error is Map<String, dynamic>) {
+        final details = error['details'];
+        if (details is List) {
+          for (final item in details) {
+            if (item is Map<String, dynamic>) {
+              final retryDelay = item['retryDelay'];
+              if (retryDelay is String) {
+                final parsed = _parseSecondsDuration(retryDelay);
+                if (parsed != null) {
+                  return parsed;
+                }
+              }
+            }
+          }
+        }
+
+        final message = error['message'];
+        if (message is String) {
+          final match = RegExp(
+            r'retry in\s+([0-9]+(?:\.[0-9]+)?)s',
+            caseSensitive: false,
+          ).firstMatch(message);
+          if (match != null) {
+            final seconds = double.tryParse(match.group(1)!);
+            if (seconds != null) {
+              return Duration(milliseconds: (seconds * 1000).round());
+            }
+          }
+        }
+      }
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+Duration? _parseSecondsDuration(String value) {
+  final match = RegExp(r'^([0-9]+(?:\.[0-9]+)?)s$').firstMatch(value.trim());
+  if (match == null) {
+    return null;
+  }
+  final seconds = double.tryParse(match.group(1)!);
+  if (seconds == null) {
+    return null;
+  }
+  return Duration(milliseconds: (seconds * 1000).round());
 }
 
 bool _isNoiseLine(String line) {
