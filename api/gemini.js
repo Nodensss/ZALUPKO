@@ -9,7 +9,19 @@ export const config = {
   },
 };
 
-function buildPrompt() {
+function buildPrompt(task) {
+  if (task === 'text_with_description') {
+    return `
+Ты получишь скриншот на русском языке.
+Извлеки весь видимый текст и отдельно укажи описание изображения, если такое описание есть на скриншоте.
+
+Ответ верни строго в JSON без пояснений:
+{"full_text":"...","image_description":"..."}
+
+Если описания нет, верни пустую строку в "image_description".
+`.trim();
+  }
+
   return `
 Ты получишь скриншот тестового вопроса на русском языке.
 Нужно извлечь:
@@ -43,7 +55,11 @@ export default async function handler(req, res) {
     }
   }
 
-  const { image_base64: imageBase64, mime_type: mimeType } = body || {};
+  const {
+    image_base64: imageBase64,
+    mime_type: mimeType,
+    task = 'question_parser',
+  } = body || {};
   if (!imageBase64) {
     res.status(400).json({ error: 'image_base64 is required' });
     return;
@@ -59,7 +75,7 @@ export default async function handler(req, res) {
               data: imageBase64,
             },
           },
-          { text: buildPrompt() },
+          { text: buildPrompt(task) },
         ],
       },
     ],

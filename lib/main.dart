@@ -1,6 +1,4 @@
 import 'dart:convert';
-import 'dart:typed_data';
-
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -48,17 +46,21 @@ class OcrHomePage extends StatefulWidget {
 
 class _OcrHomePageState extends State<OcrHomePage> {
   final TextEditingController _apiKeyController = TextEditingController();
-  final TextEditingController _endpointController =
-      TextEditingController(
-        text: '/api/gemini',
-      );
+  final TextEditingController _endpointController = TextEditingController(
+    text: '/api/gemini',
+  );
 
   Uint8List? _imageBytes;
   String? _imageName;
   bool _isProcessing = false;
+  bool _isBatchProcessing = false;
+  double _batchProgress = 0;
   String? _errorMessage;
+  String? _batchErrorMessage;
   String? _rawText;
   ParsedQuestion? _parsed;
+  List<BatchSourceImage> _batchImages = [];
+  List<BatchExtractionEntry> _batchResults = [];
   SharedPreferences? _prefs;
 
   @override
@@ -124,6 +126,47 @@ class _OcrHomePageState extends State<OcrHomePage> {
     });
   }
 
+  Future<void> _pickBatchImages() async {
+    setState(() {
+      _batchErrorMessage = null;
+    });
+
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.image,
+      allowMultiple: true,
+      withData: true,
+    );
+    if (result == null) {
+      return;
+    }
+
+    final images = <BatchSourceImage>[];
+    for (final file in result.files) {
+      final bytes = file.bytes;
+      if (bytes == null) {
+        continue;
+      }
+      images.add(BatchSourceImage(name: file.name, bytes: bytes));
+    }
+
+    if (images.isEmpty) {
+      setState(() {
+        _batchErrorMessage = 'Не удалось прочитать выбранные файлы.';
+      });
+      return;
+    }
+
+    final limited = images.take(30).toList();
+    setState(() {
+      _batchImages = limited;
+      _batchResults = [];
+      _batchProgress = 0;
+      if (images.length > 30) {
+        _batchErrorMessage = 'Выбрано больше 30 изображений. Взяты первые 30.';
+      }
+    });
+  }
+
   Future<void> _runOcr() async {
     if (_imageBytes == null) {
       setState(() {
@@ -151,37 +194,14 @@ class _OcrHomePageState extends State<OcrHomePage> {
     });
 
     try {
-      final mimeType = _guessMimeType(_imageName);
-      final base64Image = base64Encode(_imageBytes!);
-      final response = await _sendGeminiRequest(
-        endpointUri,
-        apiKey,
-        base64Image,
-        mimeType,
+      final cleanedText = await _requestGeminiText(
+        imageBytes: _imageBytes!,
+        imageName: _imageName ?? 'screenshot.png',
+        endpointUri: endpointUri,
+        apiKey: apiKey,
         useProxy: useProxy,
+        task: GeminiTask.questionParser,
       );
-
-      if (response.statusCode != 200) {
-        throw Exception(
-          'Gemini API вернул статус ${response.statusCode}. ${response.body}',
-        );
-      }
-
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final candidates = data['candidates'] as List?;
-      if (candidates == null || candidates.isEmpty) {
-        throw Exception('Gemini не вернул ответ.');
-      }
-      final parts =
-          (candidates.first as Map<String, dynamic>)['content']?['parts'] as List?;
-      if (parts == null || parts.isEmpty) {
-        throw Exception('Gemini не вернул текст.');
-      }
-      final text = (parts.first as Map<String, dynamic>)['text'] as String? ?? '';
-      final cleanedText = text.trim();
-      if (cleanedText.isEmpty) {
-        throw Exception('Gemini вернул пустой текст.');
-      }
 
       final parsed = parseGeminiOutput(cleanedText);
       if (!mounted) {
@@ -199,13 +219,134 @@ class _OcrHomePageState extends State<OcrHomePage> {
         _errorMessage = error.toString();
       });
     } finally {
-      if (!mounted) {
-        return;
+      if (mounted) {
+        setState(() {
+          _isProcessing = false;
+        });
       }
-      setState(() {
-        _isProcessing = false;
-      });
     }
+  }
+
+  Future<void> _runBatchOcr() async {
+    if (_batchImages.isEmpty) {
+      setState(() {
+        _batchErrorMessage =
+            'Сначала выберите изображения для пакетной обработки.';
+      });
+      return;
+    }
+
+    final endpointText = _endpointController.text.trim();
+    final endpointUri = _resolveEndpoint(endpointText);
+    final useProxy =
+        endpointText.startsWith('/api/') || !endpointText.startsWith('http');
+    final apiKey = _apiKeyController.text.trim();
+    if (!useProxy && apiKey.isEmpty) {
+      setState(() {
+        _batchErrorMessage = 'Введите Gemini API ключ.';
+      });
+      return;
+    }
+
+    setState(() {
+      _isBatchProcessing = true;
+      _batchErrorMessage = null;
+      _batchResults = [];
+      _batchProgress = 0;
+    });
+
+    final results = <BatchExtractionEntry>[];
+    try {
+      final total = _batchImages.length;
+      for (var i = 0; i < total; i++) {
+        final image = _batchImages[i];
+        try {
+          final cleanedText = await _requestGeminiText(
+            imageBytes: image.bytes,
+            imageName: image.name,
+            endpointUri: endpointUri,
+            apiKey: apiKey,
+            useProxy: useProxy,
+            task: GeminiTask.textWithDescription,
+          );
+          final parsed = parseBatchGeminiOutput(cleanedText);
+          results.add(
+            BatchExtractionEntry(
+              fileName: image.name,
+              fullText: parsed.fullText,
+              imageDescription: parsed.imageDescription,
+            ),
+          );
+        } catch (error) {
+          results.add(
+            BatchExtractionEntry(
+              fileName: image.name,
+              fullText: '',
+              imageDescription: '',
+              error: error.toString(),
+            ),
+          );
+        }
+
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _batchResults = List.unmodifiable(results);
+          _batchProgress = (i + 1) / total;
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isBatchProcessing = false;
+        });
+      }
+    }
+  }
+
+  Future<String> _requestGeminiText({
+    required Uint8List imageBytes,
+    required String imageName,
+    required Uri endpointUri,
+    required String apiKey,
+    required bool useProxy,
+    required GeminiTask task,
+  }) async {
+    final mimeType = _guessMimeType(imageName);
+    final base64Image = base64Encode(imageBytes);
+    final response = await _sendGeminiRequest(
+      endpointUri,
+      apiKey,
+      base64Image,
+      mimeType,
+      useProxy: useProxy,
+      task: task,
+    );
+
+    if (response.statusCode != 200) {
+      throw Exception(
+        'Gemini API вернул статус ${response.statusCode}. ${response.body}',
+      );
+    }
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final candidates = data['candidates'] as List?;
+    if (candidates == null || candidates.isEmpty) {
+      throw Exception('Gemini не вернул ответ.');
+    }
+    final parts =
+        (candidates.first as Map<String, dynamic>)['content']?['parts']
+            as List?;
+    if (parts == null || parts.isEmpty) {
+      throw Exception('Gemini не вернул текст.');
+    }
+    final text = (parts.first as Map<String, dynamic>)['text'] as String? ?? '';
+    final cleanedText = text.trim();
+    if (cleanedText.isEmpty) {
+      throw Exception('Gemini вернул пустой текст.');
+    }
+    return cleanedText;
   }
 
   Future<void> _copyResult() async {
@@ -227,26 +368,62 @@ class _OcrHomePageState extends State<OcrHomePage> {
     if (!mounted) {
       return;
     }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Скопировано в буфер обмена')));
+  }
+
+  Future<void> _copyBatchEntry(BatchExtractionEntry entry) async {
+    await Clipboard.setData(ClipboardData(text: _formatBatchEntry(entry)));
+    if (!mounted) {
+      return;
+    }
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Скопировано в буфер обмена')),
+      SnackBar(content: Text('Скопирован файл: ${entry.fileName}')),
     );
+  }
+
+  Future<void> _copyAllBatchResults() async {
+    if (_batchResults.isEmpty) {
+      return;
+    }
+    final text = _batchResults.map(_formatBatchEntry).join('\n\n-----\n\n');
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Все результаты скопированы')));
+  }
+
+  String _formatBatchEntry(BatchExtractionEntry entry) {
+    final buffer = StringBuffer();
+    buffer.writeln('Файл: ${entry.fileName}');
+    if (entry.error != null && entry.error!.isNotEmpty) {
+      buffer.writeln('Ошибка: ${entry.error}');
+      return buffer.toString().trim();
+    }
+    if (entry.imageDescription.isNotEmpty) {
+      buffer.writeln('Описание: ${entry.imageDescription}');
+    } else {
+      buffer.writeln('Описание: -');
+    }
+    buffer.writeln('Текст:');
+    buffer.writeln(entry.fullText);
+    return buffer.toString().trim();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Сканер правильных ответов'),
-      ),
+      appBar: AppBar(title: const Text('Сканер правильных ответов')),
       body: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
-            colors: [
-              Color(0xFFE7F3F4),
-              Color(0xFFFDF7EC),
-            ],
+            colors: [Color(0xFFE7F3F4), Color(0xFFFDF7EC)],
           ),
         ),
         child: Center(
@@ -277,6 +454,20 @@ class _OcrHomePageState extends State<OcrHomePage> {
                     const SizedBox(height: 16),
                     _buildRawTextCard(_rawText!),
                   ],
+                  const SizedBox(height: 24),
+                  _buildBatchCard(context),
+                  if (_batchErrorMessage != null) ...[
+                    const SizedBox(height: 12),
+                    _buildErrorCard(_batchErrorMessage!),
+                  ],
+                  if (_isBatchProcessing) ...[
+                    const SizedBox(height: 12),
+                    _buildBatchLoadingCard(),
+                  ],
+                  if (_batchResults.isNotEmpty) ...[
+                    const SizedBox(height: 16),
+                    _buildBatchResultsCard(),
+                  ],
                 ],
               ),
             ),
@@ -289,7 +480,7 @@ class _OcrHomePageState extends State<OcrHomePage> {
   Widget _buildIntroCard(BuildContext context) {
     return Card(
       elevation: 0,
-      color: Colors.white.withOpacity(0.9),
+      color: Colors.white.withValues(alpha: 0.9),
       child: Padding(
         padding: const EdgeInsets.all(20),
         child: Column(
@@ -301,7 +492,7 @@ class _OcrHomePageState extends State<OcrHomePage> {
             ),
             SizedBox(height: 8),
             Text(
-              'Используется серверный ключ Gemini через /api/gemini.',
+              'Есть одиночный и пакетный режим (до 30 файлов) через /api/gemini.',
             ),
           ],
         ),
@@ -327,15 +518,15 @@ class _OcrHomePageState extends State<OcrHomePage> {
             const SizedBox(height: 12),
             TextField(
               controller: _endpointController,
-              decoration: const InputDecoration(
-                labelText: 'Gemini endpoint',
-              ),
+              decoration: const InputDecoration(labelText: 'Gemini endpoint'),
             ),
             const SizedBox(height: 12),
             FilledButton.icon(
               onPressed: _pickImage,
               icon: const Icon(Icons.image_outlined),
-              label: Text(_imageBytes == null ? 'Выбрать скриншот' : 'Выбрать другой'),
+              label: Text(
+                _imageBytes == null ? 'Выбрать скриншот' : 'Выбрать другой',
+              ),
             ),
             const SizedBox(height: 12),
             if (_imageBytes != null)
@@ -356,6 +547,173 @@ class _OcrHomePageState extends State<OcrHomePage> {
         ),
       ),
     );
+  }
+
+  Widget _buildBatchCard(BuildContext context) {
+    return Card(
+      elevation: 0,
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text(
+              'Пакетная обработка (до 30 скриншотов)',
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Извлекает текст и описание изображения, если оно есть на скриншоте.',
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: _isBatchProcessing ? null : _pickBatchImages,
+              icon: const Icon(Icons.photo_library_outlined),
+              label: Text(
+                _batchImages.isEmpty
+                    ? 'Выбрать несколько скриншотов'
+                    : 'Выбрано: ${_batchImages.length}',
+              ),
+            ),
+            if (_batchImages.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(
+                _buildSelectedFilesPreview(),
+                style: const TextStyle(color: Colors.black54),
+              ),
+            ],
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: (_isBatchProcessing || _batchImages.isEmpty)
+                  ? null
+                  : _runBatchOcr,
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('Распознать все'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBatchLoadingCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Обработка: ${(_batchProgress * 100).toStringAsFixed(0)}%',
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 8),
+            LinearProgressIndicator(value: _batchProgress),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBatchResultsCard() {
+    final successCount = _batchResults
+        .where((item) => item.error == null)
+        .length;
+    return Card(
+      elevation: 0,
+      color: Colors.white,
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Результаты: $successCount/${_batchResults.length}',
+                    style: const TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                FilledButton.icon(
+                  onPressed: _copyAllBatchResults,
+                  icon: const Icon(Icons.copy),
+                  label: const Text('Копировать все'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            ..._batchResults.map((item) {
+              final hasError = item.error != null && item.error!.isNotEmpty;
+              return Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: hasError
+                      ? const Color(0xFFFFF0ED)
+                      : const Color(0xFFF8F9FB),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            item.fileName,
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => _copyBatchEntry(item),
+                          tooltip: 'Копировать',
+                          icon: const Icon(Icons.copy),
+                        ),
+                      ],
+                    ),
+                    if (hasError)
+                      Text(
+                        item.error!,
+                        style: const TextStyle(color: Color(0xFFB3261E)),
+                      )
+                    else ...[
+                      if (item.imageDescription.isNotEmpty) ...[
+                        const Text(
+                          'Описание:',
+                          style: TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        Text(item.imageDescription),
+                        const SizedBox(height: 8),
+                      ],
+                      const Text(
+                        'Текст:',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      Text(item.fullText),
+                    ],
+                  ],
+                ),
+              );
+            }),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _buildSelectedFilesPreview() {
+    if (_batchImages.isEmpty) {
+      return '';
+    }
+    final names = _batchImages.take(5).map((file) => file.name).join(', ');
+    if (_batchImages.length <= 5) {
+      return names;
+    }
+    return '$names и еще ${_batchImages.length - 5}';
   }
 
   Widget _buildErrorCard(String message) {
@@ -419,19 +777,28 @@ class _OcrHomePageState extends State<OcrHomePage> {
               final isCorrect = index == correctIndex;
               return Container(
                 margin: const EdgeInsets.only(bottom: 8),
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
                 decoration: BoxDecoration(
-                  color: isCorrect ? const Color(0xFFE6F7ED) : const Color(0xFFF5F5F5),
+                  color: isCorrect
+                      ? const Color(0xFFE6F7ED)
+                      : const Color(0xFFF5F5F5),
                   borderRadius: BorderRadius.circular(12),
                   border: Border.all(
-                    color: isCorrect ? const Color(0xFF1F8B4C) : Colors.transparent,
+                    color: isCorrect
+                        ? const Color(0xFF1F8B4C)
+                        : Colors.transparent,
                   ),
                 ),
                 child: Row(
                   children: [
                     Icon(
                       isCorrect ? Icons.check_circle : Icons.circle_outlined,
-                      color: isCorrect ? const Color(0xFF1F8B4C) : Colors.black54,
+                      color: isCorrect
+                          ? const Color(0xFF1F8B4C)
+                          : Colors.black54,
                     ),
                     const SizedBox(width: 10),
                     Expanded(child: Text(parsed.options[index])),
@@ -439,7 +806,8 @@ class _OcrHomePageState extends State<OcrHomePage> {
                 ),
               );
             }),
-            if (parsed.correctAnswer != null && parsed.correctAnswer!.isNotEmpty)
+            if (parsed.correctAnswer != null &&
+                parsed.correctAnswer!.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
                 child: Text(
@@ -487,6 +855,42 @@ class ParsedQuestion {
   final List<String> options;
   final String? correctAnswer;
   final int? correctIndex;
+}
+
+class BatchSourceImage {
+  BatchSourceImage({required this.name, required this.bytes});
+
+  final String name;
+  final Uint8List bytes;
+}
+
+class BatchExtractionEntry {
+  BatchExtractionEntry({
+    required this.fileName,
+    required this.fullText,
+    required this.imageDescription,
+    this.error,
+  });
+
+  final String fileName;
+  final String fullText;
+  final String imageDescription;
+  final String? error;
+}
+
+class BatchGeminiOutput {
+  BatchGeminiOutput({required this.fullText, required this.imageDescription});
+
+  final String fullText;
+  final String imageDescription;
+}
+
+enum GeminiTask {
+  questionParser('question_parser'),
+  textWithDescription('text_with_description');
+
+  const GeminiTask(this.value);
+  final String value;
 }
 
 ParsedQuestion parseOcrText(String text) {
@@ -552,8 +956,8 @@ ParsedQuestion parseOcrText(String text) {
   }
 
   int? correctIndex;
-  if (correctAnswer != null && correctAnswer!.isNotEmpty) {
-    final normalizedCorrect = _normalize(correctAnswer!);
+  if (correctAnswer != null && correctAnswer.isNotEmpty) {
+    final normalizedCorrect = _normalize(correctAnswer);
     for (var i = 0; i < options.length; i++) {
       final normalizedOption = _normalize(options[i]);
       if (normalizedOption == normalizedCorrect ||
@@ -578,14 +982,14 @@ ParsedQuestion parseGeminiOutput(String text) {
   final jsonCandidate = _tryExtractJson(cleaned);
   if (jsonCandidate != null) {
     final question = (jsonCandidate['question'] as String?)?.trim();
-    final options = (jsonCandidate['options'] as List?)
+    final options =
+        (jsonCandidate['options'] as List?)
             ?.whereType<String>()
             .map((e) => e.trim())
             .where((e) => e.isNotEmpty)
             .toList() ??
         <String>[];
-    final correctAnswer =
-        (jsonCandidate['correct_answer'] as String?)?.trim();
+    final correctAnswer = (jsonCandidate['correct_answer'] as String?)?.trim();
     int? correctIndex;
     if (correctAnswer != null && correctAnswer.isNotEmpty) {
       final normalizedCorrect = _normalize(correctAnswer);
@@ -610,6 +1014,29 @@ ParsedQuestion parseGeminiOutput(String text) {
   return parseOcrText(cleaned);
 }
 
+BatchGeminiOutput parseBatchGeminiOutput(String text) {
+  final cleaned = _stripCodeFence(text);
+  final jsonCandidate = _tryExtractJson(cleaned);
+  if (jsonCandidate == null) {
+    return BatchGeminiOutput(fullText: cleaned, imageDescription: '');
+  }
+
+  final fullText =
+      ((jsonCandidate['full_text'] ?? jsonCandidate['text']) as String?)
+          ?.trim() ??
+      '';
+  final imageDescription =
+      ((jsonCandidate['image_description'] ?? jsonCandidate['description'])
+              as String?)
+          ?.trim() ??
+      '';
+
+  return BatchGeminiOutput(
+    fullText: fullText.isEmpty ? cleaned : fullText,
+    imageDescription: imageDescription,
+  );
+}
+
 String _buildPrompt() {
   return '''
 Ты получишь скриншот тестового вопроса на русском языке.
@@ -620,6 +1047,18 @@ String _buildPrompt() {
 
 Ответ верни строго в JSON без пояснений:
 {"question":"...","options":["...","..."],"correct_answer":"..."}
+''';
+}
+
+String _buildBatchPrompt() {
+  return '''
+Ты получишь скриншот на русском языке.
+Извлеки весь видимый текст и отдельно укажи описание изображения, если такое описание присутствует.
+
+Верни строго JSON без пояснений:
+{"full_text":"...","image_description":"..."}
+
+Если описания нет, верни пустую строку в "image_description".
 ''';
 }
 
@@ -637,11 +1076,13 @@ Future<http.Response> _sendGeminiRequest(
   String base64Image,
   String mimeType, {
   required bool useProxy,
+  required GeminiTask task,
 }) {
   if (useProxy) {
     final payload = jsonEncode({
       'image_base64': base64Image,
       'mime_type': mimeType,
+      'task': task.value,
     });
     return http.post(
       endpoint,
@@ -650,29 +1091,25 @@ Future<http.Response> _sendGeminiRequest(
     );
   }
 
-  final prompt = _buildPrompt();
+  final prompt = task == GeminiTask.textWithDescription
+      ? _buildBatchPrompt()
+      : _buildPrompt();
   final payload = jsonEncode({
     'contents': [
       {
         'parts': [
           {
-            'inline_data': {
-              'mime_type': mimeType,
-              'data': base64Image,
-            }
+            'inline_data': {'mime_type': mimeType, 'data': base64Image},
           },
           {'text': prompt},
         ],
-      }
+      },
     ],
   });
 
   return http.post(
     endpoint,
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': apiKey,
-    },
+    headers: {'Content-Type': 'application/json', 'x-goog-api-key': apiKey},
     body: payload,
   );
 }
