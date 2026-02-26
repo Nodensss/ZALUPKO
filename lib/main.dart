@@ -45,10 +45,11 @@ class OcrHomePage extends StatefulWidget {
 }
 
 class _OcrHomePageState extends State<OcrHomePage> {
-  final TextEditingController _apiKeyController = TextEditingController();
-  final TextEditingController _endpointController = TextEditingController(
-    text: '/api/gemini',
+  final TextEditingController _nvidiaModelController = TextEditingController(
+    text: 'google/gemma-3-27b-it',
   );
+  AiProvider _primaryProvider = AiProvider.gemini;
+  bool _useFallbackProvider = true;
 
   Uint8List? _imageBytes;
   String? _imageName;
@@ -67,36 +68,61 @@ class _OcrHomePageState extends State<OcrHomePage> {
   void initState() {
     super.initState();
     _loadPrefs();
-    _apiKeyController.addListener(_saveApiKey);
+    _nvidiaModelController.addListener(_saveProviderSettings);
   }
 
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    final savedKey = prefs.getString('ocr_api_key') ?? '';
+    final savedProvider = prefs.getString('primary_provider');
+    final savedFallback = prefs.getBool('use_fallback_provider');
+    final savedNvidiaModel = prefs.getString('nvidia_model');
+
+    final provider = AiProvider.values.firstWhere(
+      (item) => item.value == savedProvider,
+      orElse: () => AiProvider.gemini,
+    );
+
     if (!mounted) {
       return;
     }
     setState(() {
       _prefs = prefs;
-      if (savedKey.isNotEmpty) {
-        _apiKeyController.text = savedKey;
+      _primaryProvider = provider;
+      _useFallbackProvider = savedFallback ?? true;
+      if (savedNvidiaModel != null && savedNvidiaModel.trim().isNotEmpty) {
+        _nvidiaModelController.text = savedNvidiaModel.trim();
       }
     });
   }
 
-  void _saveApiKey() {
+  void _saveProviderSettings() {
     final prefs = _prefs;
     if (prefs == null) {
       return;
     }
-    prefs.setString('ocr_api_key', _apiKeyController.text.trim());
+    prefs.setString('primary_provider', _primaryProvider.value);
+    prefs.setBool('use_fallback_provider', _useFallbackProvider);
+    prefs.setString('nvidia_model', _nvidiaModelController.text.trim());
+  }
+
+  void _setPrimaryProvider(AiProvider provider) {
+    setState(() {
+      _primaryProvider = provider;
+    });
+    _saveProviderSettings();
+  }
+
+  void _setUseFallback(bool enabled) {
+    setState(() {
+      _useFallbackProvider = enabled;
+    });
+    _saveProviderSettings();
   }
 
   @override
   void dispose() {
-    _apiKeyController.removeListener(_saveApiKey);
-    _apiKeyController.dispose();
-    _endpointController.dispose();
+    _nvidiaModelController.removeListener(_saveProviderSettings);
+    _nvidiaModelController.dispose();
     super.dispose();
   }
 
@@ -174,17 +200,7 @@ class _OcrHomePageState extends State<OcrHomePage> {
       });
       return;
     }
-    final endpointText = _endpointController.text.trim();
-    final endpointUri = _resolveEndpoint(endpointText);
-    final useProxy =
-        endpointText.startsWith('/api/') || !endpointText.startsWith('http');
-    final apiKey = _apiKeyController.text.trim();
-    if (!useProxy && apiKey.isEmpty) {
-      setState(() {
-        _errorMessage = 'Введите Gemini API ключ.';
-      });
-      return;
-    }
+    final providerChain = _buildProviderChain();
 
     setState(() {
       _isProcessing = true;
@@ -194,13 +210,11 @@ class _OcrHomePageState extends State<OcrHomePage> {
     });
 
     try {
-      final cleanedText = await _requestGeminiText(
+      final cleanedText = await _requestAiTextWithFallback(
         imageBytes: _imageBytes!,
         imageName: _imageName ?? 'screenshot.png',
-        endpointUri: endpointUri,
-        apiKey: apiKey,
-        useProxy: useProxy,
         task: GeminiTask.questionParser,
+        providers: providerChain,
       );
 
       final parsed = parseGeminiOutput(cleanedText);
@@ -235,18 +249,7 @@ class _OcrHomePageState extends State<OcrHomePage> {
       });
       return;
     }
-
-    final endpointText = _endpointController.text.trim();
-    final endpointUri = _resolveEndpoint(endpointText);
-    final useProxy =
-        endpointText.startsWith('/api/') || !endpointText.startsWith('http');
-    final apiKey = _apiKeyController.text.trim();
-    if (!useProxy && apiKey.isEmpty) {
-      setState(() {
-        _batchErrorMessage = 'Введите Gemini API ключ.';
-      });
-      return;
-    }
+    final providerChain = _buildProviderChain();
 
     setState(() {
       _isBatchProcessing = true;
@@ -262,13 +265,11 @@ class _OcrHomePageState extends State<OcrHomePage> {
       for (var i = 0; i < total; i++) {
         final image = _batchImages[i];
         if (lastRequestAt != null) {
-          await _waitForBatchRateLimit(lastRequestAt);
+          await _waitForBatchRateLimit(lastRequestAt, _primaryProvider);
         }
         final entry = await _extractBatchEntryWithRetry(
           image: image,
-          endpointUri: endpointUri,
-          apiKey: apiKey,
-          useProxy: useProxy,
+          providers: providerChain,
         );
         lastRequestAt = DateTime.now();
         results.add(entry);
@@ -301,8 +302,11 @@ class _OcrHomePageState extends State<OcrHomePage> {
     }
   }
 
-  Future<void> _waitForBatchRateLimit(DateTime lastRequestAt) async {
-    const minimumGap = Duration(seconds: 13);
+  Future<void> _waitForBatchRateLimit(
+    DateTime lastRequestAt,
+    AiProvider provider,
+  ) async {
+    final minimumGap = _minimumGapForProvider(provider);
     final elapsed = DateTime.now().difference(lastRequestAt);
     final remaining = minimumGap - elapsed;
     if (remaining > Duration.zero) {
@@ -312,21 +316,17 @@ class _OcrHomePageState extends State<OcrHomePage> {
 
   Future<BatchExtractionEntry> _extractBatchEntryWithRetry({
     required BatchSourceImage image,
-    required Uri endpointUri,
-    required String apiKey,
-    required bool useProxy,
+    required List<ProviderRequestConfig> providers,
   }) async {
     const maxRetries = 4;
 
     for (var attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        final cleanedText = await _requestGeminiText(
+        final cleanedText = await _requestAiTextWithFallback(
           imageBytes: image.bytes,
           imageName: image.name,
-          endpointUri: endpointUri,
-          apiKey: apiKey,
-          useProxy: useProxy,
           task: GeminiTask.textWithDescription,
+          providers: providers,
         );
         final parsed = parseBatchGeminiOutput(cleanedText);
         return BatchExtractionEntry(
@@ -334,7 +334,7 @@ class _OcrHomePageState extends State<OcrHomePage> {
           fullText: parsed.fullText,
           imageDescription: parsed.imageDescription,
         );
-      } on GeminiApiException catch (error) {
+      } on AiApiException catch (error) {
         if (error.statusCode != 429 || attempt == maxRetries) {
           return BatchExtractionEntry(
             fileName: image.name,
@@ -350,7 +350,7 @@ class _OcrHomePageState extends State<OcrHomePage> {
         if (mounted) {
           setState(() {
             _batchErrorMessage =
-                'Лимит API. Ожидание ${waitDuration.inSeconds} сек, затем повтор.';
+                'Лимит ${error.provider.label}. Ожидание ${waitDuration.inSeconds} сек, затем повтор.';
           });
         }
         await Future.delayed(waitDuration);
@@ -372,50 +372,151 @@ class _OcrHomePageState extends State<OcrHomePage> {
     );
   }
 
-  Future<String> _requestGeminiText({
+  Future<String> _requestAiTextWithFallback({
     required Uint8List imageBytes,
     required String imageName,
-    required Uri endpointUri,
-    required String apiKey,
-    required bool useProxy,
+    required GeminiTask task,
+    required List<ProviderRequestConfig> providers,
+  }) async {
+    AiApiException? lastApiError;
+    for (final provider in providers) {
+      try {
+        return await _requestAiText(
+          imageBytes: imageBytes,
+          imageName: imageName,
+          provider: provider,
+          task: task,
+        );
+      } on AiApiException catch (error) {
+        lastApiError = error;
+        if (!_isRetryableStatus(error.statusCode)) {
+          rethrow;
+        }
+      }
+    }
+
+    if (lastApiError != null) {
+      throw lastApiError;
+    }
+    throw Exception('Не удалось получить ответ от AI провайдера.');
+  }
+
+  Future<String> _requestAiText({
+    required Uint8List imageBytes,
+    required String imageName,
+    required ProviderRequestConfig provider,
     required GeminiTask task,
   }) async {
     final mimeType = _guessMimeType(imageName);
     final base64Image = base64Encode(imageBytes);
-    final response = await _sendGeminiRequest(
-      endpointUri,
-      apiKey,
+    final response = await _sendAiRequest(
+      provider.endpointUri,
       base64Image,
       mimeType,
-      useProxy: useProxy,
+      provider: provider.provider,
+      model: provider.model,
       task: task,
     );
 
     if (response.statusCode != 200) {
-      throw GeminiApiException(
+      throw AiApiException(
+        provider: provider.provider,
         statusCode: response.statusCode,
         body: response.body,
         retryAfter: _extractRetryAfterFromBody(response.body),
       );
     }
 
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
-    final candidates = data['candidates'] as List?;
-    if (candidates == null || candidates.isEmpty) {
-      throw Exception('Gemini не вернул ответ.');
-    }
-    final parts =
-        (candidates.first as Map<String, dynamic>)['content']?['parts']
-            as List?;
-    if (parts == null || parts.isEmpty) {
-      throw Exception('Gemini не вернул текст.');
-    }
-    final text = (parts.first as Map<String, dynamic>)['text'] as String? ?? '';
+    final text = _extractTextFromProviderResponse(
+      provider.provider,
+      response.body,
+    );
     final cleanedText = text.trim();
     if (cleanedText.isEmpty) {
-      throw Exception('Gemini вернул пустой текст.');
+      throw Exception('${provider.provider.label} вернул пустой текст.');
     }
     return cleanedText;
+  }
+
+  List<ProviderRequestConfig> _buildProviderChain() {
+    final primary = ProviderRequestConfig(
+      provider: _primaryProvider,
+      endpointUri: Uri.base.resolve(_primaryProvider.endpointPath),
+      model: _primaryProvider == AiProvider.nvidia
+          ? _nvidiaModelController.text.trim()
+          : null,
+    );
+    if (!_useFallbackProvider) {
+      return [primary];
+    }
+
+    final fallbackProvider = _primaryProvider == AiProvider.gemini
+        ? AiProvider.nvidia
+        : AiProvider.gemini;
+    final fallback = ProviderRequestConfig(
+      provider: fallbackProvider,
+      endpointUri: Uri.base.resolve(fallbackProvider.endpointPath),
+      model: fallbackProvider == AiProvider.nvidia
+          ? _nvidiaModelController.text.trim()
+          : null,
+    );
+    return [primary, fallback];
+  }
+
+  Duration _minimumGapForProvider(AiProvider provider) {
+    if (provider == AiProvider.nvidia) {
+      return const Duration(seconds: 2);
+    }
+    return const Duration(seconds: 13);
+  }
+
+  bool _isRetryableStatus(int statusCode) {
+    if (statusCode == 429 || statusCode == 408) {
+      return true;
+    }
+    return statusCode >= 500 && statusCode <= 599;
+  }
+
+  String _extractTextFromProviderResponse(AiProvider provider, String body) {
+    final data = jsonDecode(body) as Map<String, dynamic>;
+    if (provider == AiProvider.gemini) {
+      final candidates = data['candidates'] as List?;
+      if (candidates == null || candidates.isEmpty) {
+        throw Exception('Gemini не вернул ответ.');
+      }
+      final parts =
+          (candidates.first as Map<String, dynamic>)['content']?['parts']
+              as List?;
+      if (parts == null || parts.isEmpty) {
+        throw Exception('Gemini не вернул текст.');
+      }
+      return (parts.first as Map<String, dynamic>)['text'] as String? ?? '';
+    }
+
+    final choices = data['choices'] as List?;
+    if (choices == null || choices.isEmpty) {
+      throw Exception('NVIDIA не вернул ответ.');
+    }
+    final message = (choices.first as Map<String, dynamic>)['message'];
+    if (message is! Map<String, dynamic>) {
+      throw Exception('NVIDIA вернул неожиданный формат сообщения.');
+    }
+
+    final content = message['content'];
+    if (content is String) {
+      return content;
+    }
+    if (content is List) {
+      final textParts = content
+          .whereType<Map<String, dynamic>>()
+          .where((item) => item['type'] == 'text')
+          .map((item) => item['text'] as String? ?? '')
+          .where((item) => item.trim().isNotEmpty)
+          .toList();
+      return textParts.join('\n').trim();
+    }
+
+    throw Exception('NVIDIA не вернул текст.');
   }
 
   Future<void> _copyResult() async {
@@ -561,7 +662,7 @@ class _OcrHomePageState extends State<OcrHomePage> {
             ),
             SizedBox(height: 8),
             Text(
-              'Есть одиночный и пакетный режим (до 30 файлов) через /api/gemini.',
+              'Провайдеры: Gemini и NVIDIA. Можно включить fallback на второй API.',
             ),
           ],
         ),
@@ -577,17 +678,54 @@ class _OcrHomePageState extends State<OcrHomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            TextField(
-              controller: _apiKeyController,
+            DropdownButtonFormField<AiProvider>(
+              key: ValueKey(_primaryProvider),
+              initialValue: _primaryProvider,
               decoration: const InputDecoration(
-                labelText: 'Gemini API ключ (не нужен для /api/gemini)',
-                helperText: 'Если используете прямой endpoint, ключ обязателен',
+                labelText: 'Основной провайдер',
+                helperText: 'Gemini стабильнее для OCR, NVIDIA выше по RPM',
+              ),
+              items: AiProvider.values
+                  .map(
+                    (provider) => DropdownMenuItem<AiProvider>(
+                      value: provider,
+                      child: Text(provider.label),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (value) {
+                if (value == null) {
+                  return;
+                }
+                _setPrimaryProvider(value);
+              },
+            ),
+            const SizedBox(height: 12),
+            SwitchListTile(
+              value: _useFallbackProvider,
+              onChanged: _isProcessing || _isBatchProcessing
+                  ? null
+                  : _setUseFallback,
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Fallback на второй провайдер'),
+              subtitle: Text(
+                _primaryProvider == AiProvider.gemini
+                    ? 'Если Gemini вернет 429/5xx, пробуем NVIDIA'
+                    : 'Если NVIDIA вернет 429/5xx, пробуем Gemini',
               ),
             ),
             const SizedBox(height: 12),
             TextField(
-              controller: _endpointController,
-              decoration: const InputDecoration(labelText: 'Gemini endpoint'),
+              controller: _nvidiaModelController,
+              decoration: const InputDecoration(
+                labelText: 'NVIDIA model',
+                helperText: 'Пример: google/gemma-3-27b-it',
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Endpoints: ${AiProvider.gemini.endpointPath} | ${AiProvider.nvidia.endpointPath}',
+              style: const TextStyle(color: Colors.black54),
             ),
             const SizedBox(height: 12),
             FilledButton.icon(
@@ -954,13 +1092,37 @@ class BatchGeminiOutput {
   final String imageDescription;
 }
 
-class GeminiApiException implements Exception {
-  GeminiApiException({
+enum AiProvider {
+  gemini('gemini', 'Gemini', '/api/gemini'),
+  nvidia('nvidia', 'NVIDIA', '/api/nvidia');
+
+  const AiProvider(this.value, this.label, this.endpointPath);
+  final String value;
+  final String label;
+  final String endpointPath;
+}
+
+class ProviderRequestConfig {
+  const ProviderRequestConfig({
+    required this.provider,
+    required this.endpointUri,
+    this.model,
+  });
+
+  final AiProvider provider;
+  final Uri endpointUri;
+  final String? model;
+}
+
+class AiApiException implements Exception {
+  AiApiException({
+    required this.provider,
     required this.statusCode,
     required this.body,
     this.retryAfter,
   });
 
+  final AiProvider provider;
   final int statusCode;
   final String body;
   final Duration? retryAfter;
@@ -971,9 +1133,9 @@ class GeminiApiException implements Exception {
       final waitText = retryAfter == null
           ? ''
           : ' Повторите через ${retryAfter!.inSeconds} сек.';
-      return 'Превышен лимит Gemini API (429).$waitText';
+      return 'Превышен лимит ${provider.label} API (429).$waitText';
     }
-    return 'Gemini API вернул статус $statusCode. $body';
+    return '${provider.label} API вернул статус $statusCode. $body';
   }
 }
 
@@ -1129,79 +1291,26 @@ BatchGeminiOutput parseBatchGeminiOutput(String text) {
   );
 }
 
-String _buildPrompt() {
-  return '''
-Ты получишь скриншот тестового вопроса на русском языке.
-Нужно извлечь:
-1) вопрос
-2) список вариантов ответов
-3) правильный ответ (по строке "Правильный ответ: ...", если есть)
-
-Ответ верни строго в JSON без пояснений:
-{"question":"...","options":["...","..."],"correct_answer":"..."}
-''';
-}
-
-String _buildBatchPrompt() {
-  return '''
-Ты получишь скриншот на русском языке.
-Извлеки весь видимый текст и отдельно укажи описание изображения, если такое описание присутствует.
-
-Верни строго JSON без пояснений:
-{"full_text":"...","image_description":"..."}
-
-Если описания нет, верни пустую строку в "image_description".
-''';
-}
-
-Uri _resolveEndpoint(String endpoint) {
-  final uri = Uri.parse(endpoint);
-  if (uri.hasScheme) {
-    return uri;
-  }
-  return Uri.base.resolve(endpoint);
-}
-
-Future<http.Response> _sendGeminiRequest(
+Future<http.Response> _sendAiRequest(
   Uri endpoint,
-  String apiKey,
   String base64Image,
   String mimeType, {
-  required bool useProxy,
+  required AiProvider provider,
   required GeminiTask task,
+  String? model,
 }) {
-  if (useProxy) {
-    final payload = jsonEncode({
-      'image_base64': base64Image,
-      'mime_type': mimeType,
-      'task': task.value,
-    });
-    return http.post(
-      endpoint,
-      headers: {'Content-Type': 'application/json'},
-      body: payload,
-    );
-  }
-
-  final prompt = task == GeminiTask.textWithDescription
-      ? _buildBatchPrompt()
-      : _buildPrompt();
   final payload = jsonEncode({
-    'contents': [
-      {
-        'parts': [
-          {
-            'inline_data': {'mime_type': mimeType, 'data': base64Image},
-          },
-          {'text': prompt},
-        ],
-      },
-    ],
+    'image_base64': base64Image,
+    'mime_type': mimeType,
+    'task': task.value,
+    if (provider == AiProvider.nvidia &&
+        model != null &&
+        model.trim().isNotEmpty)
+      'model': model.trim(),
   });
-
   return http.post(
     endpoint,
-    headers: {'Content-Type': 'application/json', 'x-goog-api-key': apiKey},
+    headers: {'Content-Type': 'application/json'},
     body: payload,
   );
 }
